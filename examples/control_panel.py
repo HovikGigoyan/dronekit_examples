@@ -24,7 +24,7 @@ RC_SEND_MS = 100
 KEY_RELEASE_DEBOUNCE_MS = 40
 RC_CHANNEL = {"Roll": "1", "Pitch": "2", "Throttle": "3", "Yaw": "4"}
 KEY_STEP = {"Roll": 150, "Pitch": 150, "Throttle": 200, "Yaw": 150}
-KEYBOARD_MODES = ("LOITER")
+KEYBOARD_MODES = ("LOITER",)
 
 
 
