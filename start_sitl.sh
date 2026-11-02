@@ -32,10 +32,10 @@ fi
 
 if [ -n "$DISPLAY" ]; then
     GZ_FLAGS="-r -v1"
-    MAVPROXY_EXTRA="--daemon --map --console"
+    MAVPROXY_EXTRA="--map --console"
 else
     GZ_FLAGS="-s -r -v1"
-    MAVPROXY_EXTRA="--daemon"
+    MAVPROXY_EXTRA=""
 fi
 
 gz sim $GZ_FLAGS iris_runway.sdf &
