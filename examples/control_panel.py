@@ -7,6 +7,7 @@ Run inside the container (needs a display):  python3 control_panel.py
 """
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -17,14 +18,34 @@ MODES = ["GUIDED", "STABILIZE", "LOITER", "LAND", "RTL"]
 DEFAULT_TAKEOFF_ALT = 10      # meters
 STATUS_REFRESH_MS = 500
 QUEUE_POLL_MS = 100
+TELEMETRY_RATE_HZ = 10
 RC_MIN = 1000
 RC_MID = 1500
 RC_MAX = 2000
-RC_SEND_MS = 100
+RC_TICK_MS = 50
 KEY_RELEASE_DEBOUNCE_MS = 40
 RC_CHANNEL = {"Roll": "1", "Pitch": "2", "Throttle": "3", "Yaw": "4"}
-KEY_STEP = {"Roll": 150, "Pitch": 150, "Throttle": 200, "Yaw": 150}
-KEYBOARD_MODES = ("LOITER",)
+MAX_OFFSET = {"Roll": 250, "Pitch": 250, "Throttle": 300, "Yaw": 200}
+RAMP_UP_PER_S = 250 
+RAMP_DOWN_PER_S = 400
+NO_KEYBOARD_MODES = ("GUIDED",)
+
+
+def clamp_pwm(value):
+    return max(RC_MIN, min(RC_MAX, value))
+
+
+def ramp(current, target, dt):
+    if target == 0 or (current != 0 and (target > 0) != (current > 0)):
+        goal, rate = 0.0, RAMP_DOWN_PER_S
+    else:
+        goal = float(target)
+        rate = RAMP_UP_PER_S if abs(target) > abs(current) else RAMP_DOWN_PER_S
+ 
+    step = rate * dt
+    if abs(goal - current) <= step:
+        return goal
+    return current + step if goal > current else current - step
 
 
 
@@ -79,11 +100,13 @@ class ControlPanel:
         self.mode_status = tk.StringVar(value="N/A")
         self.arm_status = tk.StringVar(value="N/A")
         self.altitude_status = tk.StringVar(value="N/A")
+        self.rc_state_var = tk.StringVar(value="N/A")
         state_fields = [
             ("Connection:", self.connection_status),
             ("Mode:", self.mode_status),
             ("Armed:", self.arm_status),
-            ("Altitude:", self.altitude_status)
+            ("Altitude:", self.altitude_status),
+            ("RC override:", self.rc_state_var)
         ]
  
         for i, (name, variable) in enumerate(state_fields):
@@ -93,11 +116,12 @@ class ControlPanel:
         # ---- BLOCK 5: RC channels ----   
         rc_frame = ttk.LabelFrame(root, text="RC Channels", padding=10)
         rc_frame.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
-        self.rc_values = {name: RC_MID for name in RC_CHANNEL}
-        self.rc_bars = {}
+        self.rc_values = {name: None for name in RC_CHANNEL}
+        self.rc_cmd = {name: 0.0 for name in RC_CHANNEL}
+        self.rc_bars = {}       
         self.rc_labels = {}
  
-        for i, (name, value) in enumerate(self.rc_values.items()):
+        for i, name in enumerate(RC_CHANNEL):
             ttk.Label(rc_frame, text=name, width=10).grid(row=i, column=0, padx=5, pady=5)
  
             bar = ttk.Progressbar(
@@ -107,10 +131,10 @@ class ControlPanel:
                 mode="determinate",
                 maximum=RC_MAX - RC_MIN
             )
-            bar["value"] = value - RC_MIN
+            bar["value"] = 0
             bar.grid(row=i, column=1, padx=5)
  
-            label = ttk.Label(rc_frame, text=str(value), width=6)
+            label = ttk.Label(rc_frame, text='-', width=6)
             label.grid(row=i, column=2, padx=5)
             self.rc_bars[name] = bar
             self.rc_labels[name] = label
@@ -120,8 +144,6 @@ class ControlPanel:
         keyboard_frame.grid(row=5, column=0, padx=10, pady=5, sticky="ew")
         ttk.Label(keyboard_frame, text="W / S : Climb / Descend       A / D : Yaw").pack()
         ttk.Label(keyboard_frame, text="Left / Right : Roll       Up / Down : Pitch (fwd / back)").pack(pady=5)
-        self.rc_state_var = tk.StringVar(value="RC override: off")
-        ttk.Label(keyboard_frame, textvariable=self.rc_state_var).pack(pady=(5, 0))
  
         self.keymap = {
             "w": ("Throttle", +1),
@@ -137,6 +159,7 @@ class ControlPanel:
         self.pressed_keys = set()
         self.release_jobs = {}
         self.rc_active = False
+        self.last_tick = time.monotonic()
         root.bind("<KeyPress>", self.on_key_press)
         root.bind("<KeyRelease>", self.on_key_release)
         root.bind("<FocusOut>", self.on_focus_out)
@@ -175,26 +198,22 @@ class ControlPanel:
         self.root.after(STATUS_REFRESH_MS, self.refresh_status)
         
     # ---------- RC visualization ----------
-    def update_rc(self, name, value):
-        value = max(RC_MIN, min(RC_MAX, value))
-        self.rc_values[name] = value
-        self.rc_bars[name]["value"] = value - RC_MIN
-        self.rc_labels[name]["text"] = str(value)
- 
-    def apply_keys(self):
-        values = {name: RC_MID for name in RC_CHANNEL}
-        for key in self.pressed_keys:
-            name, direction = self.keymap[key]
-            values[name] += direction * KEY_STEP[name]
-        for name, value in values.items():
-            self.update_rc(name, value)
- 
-    def reset_rc(self):
-        for job in self.release_jobs.values():
-            self.root.after_cancel(job)
-        self.release_jobs.clear()
-        self.pressed_keys.clear()
-        self.apply_keys()
+    def on_rc_message(self, vehicle, name, msg):
+        if getattr(msg, "port", 0) != 0:
+            return
+        for rc_name, channel in RC_CHANNEL.items():
+            value = getattr(msg, "chan%s_raw" % channel, 0)
+            self.rc_values[rc_name] = value if 0 < value < 65535 else None
+            
+    def show_rc(self):
+        for name in RC_CHANNEL:
+            value = self.rc_values.get(name)
+            if value is None:
+                self.rc_bars[name]["value"] = 0
+                self.rc_labels[name]["text"] = ""
+            else:
+                self.rc_bars[name]["value"] = clamp_pwm(value) - RC_MIN
+                self.rc_labels[name]["text"] = str(value)
         
         # ---------- Keyboard ----------
     def key_name(self, event):
@@ -216,11 +235,7 @@ class ControlPanel:
         if job is not None:
             self.root.after_cancel(job)
  
-        if key in self.pressed_keys:
-            return
- 
         self.pressed_keys.add(key)
-        self.apply_keys()
  
     def on_key_release(self, event):
         key = self.key_name(event)
@@ -233,36 +248,50 @@ class ControlPanel:
     def finish_release(self, key):
         self.release_jobs.pop(key, None)
         self.pressed_keys.discard(key)
-        self.apply_keys()
  
     def on_focus_out(self, event):
-        self.reset_rc()
+        self.clear_keys()
+
+    def clear_keys(self):
+        for job in self.release_jobs.values():
+            self.root.after_cancel(job)
+        self.release_jobs.clear()
+        self.pressed_keys.clear()
+        
+    def target_offsets(self):
+        direction = {name: 0 for name in RC_CHANNEL}
+        for key in self.pressed_keys:
+            name, sign = self.keymap[key]
+            direction[name] += sign
+        return {name: max(-1, min(1, d)) * MAX_OFFSET[name] for name, d in direction.items()}
+ 
+    def zero_cmd(self):
+        for name in self.rc_cmd:
+            self.rc_cmd[name] = 0.0
  
     # ---------- RC override to the vehicle ----------
     def rc_block_reason(self):
         if self.vehicle is None:
             return "not connected"
-        mode = self.vehicle.mode.name
-        if mode not in KEYBOARD_MODES:
-            return "switch to %s" % " / ".join(KEYBOARD_MODES)
         return None
  
-    def sync_rc_override(self):
+    def sync_rc_override(self, reason, armed, keys_on):
         if self.vehicle is None:
             self.rc_active = False
             return
         try:
-            reason = self.rc_block_reason()
             if reason is None:
                 overrides = self.vehicle.channels.overrides
                 for name, channel in RC_CHANNEL.items():
-                    overrides[channel] = self.rc_values[name]
+                    overrides[channel] = clamp_pwm(RC_MID + int(round(self.rc_cmd[name])))
+                if not armed:
+                    overrides[RC_CHANNEL["Throttle"]] = RC_MIN
                 self.rc_active = True
-                self.rc_state_var.set("RC override: ACTIVE (%s)" % self.vehicle.mode.name)
+                self.rc_state_var.set("ACTIVE" if keys_on else "off")
             else:
                 if self.rc_active:
                     self.release_rc(self.vehicle)
-                self.rc_state_var.set("RC override: off (%s)" % reason)
+                self.rc_state_var.set("N/A")
         except Exception as error:
             self.status_var.set("RC override error: %s" % error)
  
@@ -272,10 +301,29 @@ class ControlPanel:
             vehicle.channels.overrides = {}
         except Exception as error:
             self.status_var.set("RC release error: %s" % error)
+            
+    def control_step(self, dt):
+        reason = self.rc_block_reason()
+        armed = reason is None and bool(self.vehicle.armed)
+        keys_on = reason is None and self.vehicle.mode.name not in NO_KEYBOARD_MODES
+        if armed and keys_on:
+            targets = self.target_offsets()
+            for name in RC_CHANNEL:
+                self.rc_cmd[name] = ramp(self.rc_cmd[name], targets[name], dt)
+        else:
+            self.zero_cmd()
+        self.sync_rc_override(reason, armed, keys_on)
+        self.show_rc()
  
     def rc_tick(self):
-        self.sync_rc_override()
-        self.root.after(RC_SEND_MS, self.rc_tick)
+        now = time.monotonic()
+        dt = min(now - self.last_tick, 0.2)
+        self.last_tick = now
+        try:
+            self.control_step(dt)
+        except Exception as error:
+            self.status_var.set("Control loop error: %s" % error)
+        self.root.after(RC_TICK_MS, self.rc_tick)
 
     # ---------- Connect ----------
     def on_connect(self):
@@ -288,7 +336,8 @@ class ControlPanel:
  
     def connect_worker(self, conn_string):
         try:
-            self.results.put(("connected", connect(conn_string, wait_ready=True, timeout=30)))
+            vehicle = connect(conn_string, wait_ready=True, timeout=30, rate=TELEMETRY_RATE_HZ)
+            self.results.put(("connected", vehicle))
         except Exception as e:
             self.results.put(("failed", e))
  
@@ -306,6 +355,8 @@ class ControlPanel:
  
     def connect_done(self, vehicle):
         self.vehicle = vehicle
+        for message in ("RC_CHANNELS", "RC_CHANNELS_RAW"):
+            vehicle.add_message_listener(message, self.on_rc_message)
         self.set_connected_ui(True)
         self.connection_status.set("Connected")
         self.status_var.set("Connected")
@@ -323,7 +374,6 @@ class ControlPanel:
         if not self.vehicle.is_armable:
             self.status_var.set("Cannot arm yet: vehicle not armable (wait for GPS/EKF)")
             return
-        self.vehicle.mode = VehicleMode("GUIDED")   # arming from code needs GUIDED
         self.vehicle.armed = True
  
     def on_takeoff(self):
@@ -343,15 +393,17 @@ class ControlPanel:
     def on_close(self):
         vehicle, self.vehicle = self.vehicle, None
         self.release_rc(vehicle)
-        self.rc_state_var.set("RC override: off")
+        self.rc_state_var.set("N/A")
         self.set_connected_ui(False)
         self.status_var.set("Not connected")
         self.connection_status.set("Disconnected")
         self.mode_status.set("N/A")
         self.arm_status.set("N/A")
         self.altitude_status.set("N/A")
-        self.reset_rc()
- 
+        self.clear_keys()
+        self.zero_cmd()
+        self.rc_values = {name: None for name in RC_CHANNEL}
+        self.show_rc()
         threading.Thread(target=vehicle.close, daemon=True).start()
  
     def on_exit(self):
