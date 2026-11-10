@@ -48,8 +48,11 @@ ENV PATH="/home/ardupilot/venv/bin:${PATH}"
 RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends python3.9-tk \
     && sudo rm -rf /var/lib/apt/lists/*
 
+RUN /home/ardupilot/venv/bin/pip install --no-cache-dir tkintermapview
+
 COPY --chown=ardupilot:ardupilot entrypoint.sh start_sitl.sh /home/ardupilot/
-RUN chmod +x /home/ardupilot/entrypoint.sh /home/ardupilot/start_sitl.sh \
+RUN sed -i 's/\r$//' /home/ardupilot/entrypoint.sh /home/ardupilot/start_sitl.sh \
+    && chmod +x /home/ardupilot/entrypoint.sh /home/ardupilot/start_sitl.sh \
     && mkdir /home/ardupilot/dronekit_examples
 
 WORKDIR /home/ardupilot/dronekit_examples
